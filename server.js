@@ -1,4 +1,3 @@
-
 const express = require("express");
 const axios   = require("axios");
 const qs      = require("querystring");
@@ -58,6 +57,36 @@ async function checkLicense(key, hwid, sessionid) {
   return licenseResp.data;
 }
 
+// ─── Helper: mapear mensaje de KeyAuth a código de motivo ────────────────────
+// KeyAuth devuelve mensajes en inglés. Los convertimos a un código
+// que la app Android usa para mostrar el mensaje correcto al usuario.
+//
+// Códigos posibles:
+//   "paused"   → Suscripción en pausa
+//   "banned"   → Baneado por infringir normas
+//   "expired"  → Licencia expirada
+//   "hwid"     → HWID no coincide (usado en otro dispositivo)
+//   "notfound" → Key eliminada / no existe
+//   "unknown"  → Otro error desconocido
+//
+function getRejectionCode(message) {
+  if (!message) return "unknown";
+
+  const msg = message.toLowerCase();
+
+  if (msg.includes("paused"))                          return "paused";
+  if (msg.includes("ban"))                             return "banned";
+  if (msg.includes("expir"))                           return "expired";
+  if (msg.includes("hwid") || msg.includes("device"))  return "hwid";
+  if (
+    msg.includes("not found") ||
+    msg.includes("invalid")   ||
+    msg.includes("doesn't exist")
+  )                                                    return "notfound";
+
+  return "unknown";
+}
+
 // ─── GET / ────────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
   res.send("Backend de Bypass Apk funcionando ✔");
@@ -73,25 +102,22 @@ app.post("/api/login-key", async (req, res) => {
   const key  = (req.body.licenseKey || "").trim();
   const hwid = (req.body.hwid       || "").trim();
 
-  if (!key) {
-    return res.json({ success: false, message: "Falta la clave de licencia" });
-  }
-  if (!hwid) {
-    return res.json({ success: false, message: "Falta el HWID" });
-  }
+  if (!key)  return res.json({ success: false, message: "Falta la clave de licencia" });
+  if (!hwid) return res.json({ success: false, message: "Falta el HWID" });
 
   try {
-    const sessionid    = await getKeyAuthSession();
-    const licenseData  = await checkLicense(key, hwid, sessionid);
+    const sessionid   = await getKeyAuthSession();
+    const licenseData = await checkLicense(key, hwid, sessionid);
 
-    // Extraer fecha de expiración si está disponible
-    const expiryText = licenseData?.info?.expiry || "Ilimitado";
+    const expiryText    = licenseData?.info?.expiry || "Ilimitado";
+    const rejectionCode = licenseData?.success ? null : getRejectionCode(licenseData?.message);
 
     return res.json({
-      success:    !!licenseData?.success,
-      message:    licenseData?.message || "Error desconocido",
-      expiryText: expiryText,
-      response:   licenseData
+      success:       !!licenseData?.success,
+      message:       licenseData?.message || "Error desconocido",
+      expiryText:    expiryText,
+      rejectionCode: rejectionCode,
+      response:      licenseData
     });
 
   } catch (e) {
@@ -103,41 +129,37 @@ app.post("/api/login-key", async (req, res) => {
 });
 
 // ─── POST /api/verify-key — Verificación en cada apertura de la app ───────────
-//
-// La app llama este endpoint cada vez que se abre.
-// Si la key fue eliminada, baneada o pausada en KeyAuth → success: false
-// La app entonces borra la sesión y manda al usuario al login.
-//
 app.post("/api/verify-key", async (req, res) => {
   const key  = (req.body.licenseKey || "").trim();
   const hwid = (req.body.hwid       || "").trim();
 
   if (!key || !hwid) {
-    return res.json({ success: false, message: "Faltan datos (key o hwid)" });
+    return res.json({ success: false, rejectionCode: "unknown", message: "Faltan datos" });
   }
 
   try {
     const sessionid   = await getKeyAuthSession();
     const licenseData = await checkLicense(key, hwid, sessionid);
 
-    const valid      = !!licenseData?.success;
-    const expiryText = licenseData?.info?.expiry || "Ilimitado";
+    const valid         = !!licenseData?.success;
+    const expiryText    = licenseData?.info?.expiry || "Ilimitado";
+    const rejectionCode = valid ? null : getRejectionCode(licenseData?.message);
 
     return res.json({
-      success:    valid,
-      message:    licenseData?.message || "Error desconocido",
-      expiryText: expiryText,
-      offline:    false
+      success:       valid,
+      message:       licenseData?.message || "Error desconocido",
+      expiryText:    expiryText,
+      rejectionCode: rejectionCode,  // "paused" | "banned" | "expired" | "hwid" | "notfound" | "unknown"
+      offline:       false
     });
 
   } catch (e) {
-    // Si NUESTRO servidor falla (Render dormido, sin internet, etc.)
-    // devolvemos offline: true para que la app decida si bloquear o no.
-    // En MainActivity.java configuramos: si offline=true → dejar pasar.
+    // Si el servidor falla → dejar pasar (no penalizar al usuario legítimo)
     return res.json({
-      success: true,
-      offline: true,
-      message: "Servidor no disponible temporalmente: " + e.message
+      success:       true,
+      offline:       true,
+      rejectionCode: null,
+      message:       "Servidor no disponible: " + e.message
     });
   }
 });
