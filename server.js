@@ -58,22 +58,9 @@ async function checkLicense(key, hwid, sessionid) {
 }
 
 // ─── Helper: mapear mensaje de KeyAuth a código de motivo ────────────────────
-// KeyAuth devuelve mensajes en inglés. Los convertimos a un código
-// que la app Android usa para mostrar el mensaje correcto al usuario.
-//
-// Códigos posibles:
-//   "paused"   → Suscripción en pausa
-//   "banned"   → Baneado por infringir normas
-//   "expired"  → Licencia expirada
-//   "hwid"     → HWID no coincide (usado en otro dispositivo)
-//   "notfound" → Key eliminada / no existe
-//   "unknown"  → Otro error desconocido
-//
 function getRejectionCode(message) {
   if (!message) return "unknown";
-
   const msg = message.toLowerCase();
-
   if (msg.includes("paused"))                          return "paused";
   if (msg.includes("ban"))                             return "banned";
   if (msg.includes("expir"))                           return "expired";
@@ -83,8 +70,81 @@ function getRejectionCode(message) {
     msg.includes("invalid")   ||
     msg.includes("doesn't exist")
   )                                                    return "notfound";
-
   return "unknown";
+}
+
+// ─── Helper: calcular tiempo restante de suscripción ─────────────────────────
+//
+// KeyAuth devuelve el campo "expiry" en el objeto "info" con formato:
+//   Unix timestamp (número)  →  ej: 1751328000
+//   O string con fecha       →  ej: "2025-06-30 12:00:00"
+//   O el string "lifetime"   →  key sin vencimiento
+//
+// Devuelve un objeto:
+//   { expiryText: "12 días, 4 horas", isLifetime: false, expiredAt: null }
+//   { expiryText: "Ilimitado ♾",      isLifetime: true,  expiredAt: null }
+//   { expiryText: "Expirada",         isLifetime: false, expiredAt: <Date> }
+//
+function calcExpiryInfo(info) {
+  // Sin info o key lifetime
+  if (!info) {
+    return { expiryText: "Ilimitado ♾", isLifetime: true, expiredAt: null };
+  }
+
+  const rawExpiry = info.expiry || info.expires || null;
+
+  // KeyAuth a veces devuelve "lifetime" o "-1" para ilimitado
+  if (
+    !rawExpiry ||
+    rawExpiry === "lifetime" ||
+    rawExpiry === "-1" ||
+    rawExpiry === -1 ||
+    rawExpiry === 0  ||
+    rawExpiry === "0"
+  ) {
+    return { expiryText: "Ilimitado ♾", isLifetime: true, expiredAt: null };
+  }
+
+  // Convertir a Date
+  let expiryDate;
+
+  if (typeof rawExpiry === "number" || /^\d+$/.test(String(rawExpiry))) {
+    // Unix timestamp en segundos
+    expiryDate = new Date(Number(rawExpiry) * 1000);
+  } else {
+    // String de fecha — intentar parsear directamente
+    expiryDate = new Date(rawExpiry);
+  }
+
+  if (isNaN(expiryDate.getTime())) {
+    // No se pudo parsear → devolver el valor crudo
+    return { expiryText: String(rawExpiry), isLifetime: false, expiredAt: null };
+  }
+
+  const now       = new Date();
+  const diffMs    = expiryDate - now;
+
+  if (diffMs <= 0) {
+    return { expiryText: "Expirada", isLifetime: false, expiredAt: expiryDate };
+  }
+
+  // Calcular días, horas y minutos restantes
+  const totalMinutes = Math.floor(diffMs / 60000);
+  const days         = Math.floor(totalMinutes / 1440);
+  const hours        = Math.floor((totalMinutes % 1440) / 60);
+  const minutes      = totalMinutes % 60;
+
+  let expiryText = "";
+
+  if (days > 0) {
+    expiryText = `${days} día${days !== 1 ? "s" : ""}, ${hours} hora${hours !== 1 ? "s" : ""}`;
+  } else if (hours > 0) {
+    expiryText = `${hours} hora${hours !== 1 ? "s" : ""}, ${minutes} min`;
+  } else {
+    expiryText = `${minutes} minuto${minutes !== 1 ? "s" : ""}`;
+  }
+
+  return { expiryText, isLifetime: false, expiredAt: null };
 }
 
 // ─── GET / ────────────────────────────────────────────────────────────────────
@@ -109,13 +169,14 @@ app.post("/api/login-key", async (req, res) => {
     const sessionid   = await getKeyAuthSession();
     const licenseData = await checkLicense(key, hwid, sessionid);
 
-    const expiryText    = licenseData?.info?.expiry || "Ilimitado";
+    const expiryInfo    = calcExpiryInfo(licenseData?.info);
     const rejectionCode = licenseData?.success ? null : getRejectionCode(licenseData?.message);
 
     return res.json({
       success:       !!licenseData?.success,
       message:       licenseData?.message || "Error desconocido",
-      expiryText:    expiryText,
+      expiryText:    expiryInfo.expiryText,     // "12 días, 4 horas" o "Ilimitado ♾"
+      isLifetime:    expiryInfo.isLifetime,
       rejectionCode: rejectionCode,
       response:      licenseData
     });
@@ -142,19 +203,19 @@ app.post("/api/verify-key", async (req, res) => {
     const licenseData = await checkLicense(key, hwid, sessionid);
 
     const valid         = !!licenseData?.success;
-    const expiryText    = licenseData?.info?.expiry || "Ilimitado";
+    const expiryInfo    = calcExpiryInfo(licenseData?.info);
     const rejectionCode = valid ? null : getRejectionCode(licenseData?.message);
 
     return res.json({
       success:       valid,
       message:       licenseData?.message || "Error desconocido",
-      expiryText:    expiryText,
-      rejectionCode: rejectionCode,  // "paused" | "banned" | "expired" | "hwid" | "notfound" | "unknown"
+      expiryText:    expiryInfo.expiryText,
+      isLifetime:    expiryInfo.isLifetime,
+      rejectionCode: rejectionCode,
       offline:       false
     });
 
   } catch (e) {
-    // Si el servidor falla → dejar pasar (no penalizar al usuario legítimo)
     return res.json({
       success:       true,
       offline:       true,
