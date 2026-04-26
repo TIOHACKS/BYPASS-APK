@@ -32,13 +32,11 @@ async function keyauthLicense(key, hwid, sessionid) {
   return resp.data;
 }
 
-// ─── Extraer timestamp de expiración (campo confirmado: subscriptions[0].expiry) ──
+// ─── Extraer timestamp de expiración ─────────────────────────────────────────
 function extractExpiry(data) {
-  // Campo confirmado por la versión anterior que funcionaba
   const sub = data?.info?.subscriptions?.[0];
   if (sub?.expiry && sub.expiry !== "0") return String(sub.expiry);
 
-  // Fallbacks
   const candidates = [
     data?.info?.expiry,
     data?.info?.expires,
@@ -51,21 +49,42 @@ function extractExpiry(data) {
   return null;
 }
 
-// ─── Clasificar respuesta de KeyAuth → código de rechazo ─────────────────────
+// ─── Clasificar respuesta de KeyAuth ─────────────────────────────────────────
+//
+// IMPORTANTE: El orden de los checks importa.
+// Primero verificar success=true, luego los casos de "válido pero con mensaje",
+// y SOLO al final los casos de rechazo real.
+//
 function classifyResponse(data) {
   const raw     = (data?.message || "").toLowerCase();
   const success = !!data?.success;
   const expiry  = extractExpiry(data);
 
-  if (success) return { valid: true, rejectionCode: null, expiry };
+  // LOG para debug
+  console.log("[CLASSIFY] success:", success, "| message:", data?.message, "| expiry:", expiry);
 
-  // Usuario ya existe con ese HWID → igual es válido (ya estaba logueado)
+  // ── CASO 1: KeyAuth dice success=true → válido ──
+  if (success) {
+    return { valid: true, rejectionCode: null, expiry };
+  }
+
+  // ── CASO 2: Mensajes que en realidad son válidos ──
+  // Key nueva usada por primera vez, HWID registrado ahora
   if (
-    raw.includes("user already exists") ||
-    raw.includes("already used")        ||
-    raw.includes("hwid locked")         ||
-    raw.includes("device already")
-  ) return { valid: true, rejectionCode: null, expiry };
+    raw.includes("user already exists")   ||
+    raw.includes("already used")          ||
+    raw.includes("hwid locked")           ||
+    raw.includes("device already")        ||
+    raw.includes("not used")              ||  // key sin usar, primer uso
+    raw.includes("registered")            ||  // recién registrado
+    raw.includes("logged in")
+  ) {
+    return { valid: true, rejectionCode: null, expiry };
+  }
+
+  // ── CASO 3: Rechazos reales ──
+  // El orden importa: verificar ban/paused/expired ANTES que hwid/invalid
+  // porque algunos mensajes pueden contener múltiples palabras
 
   if (raw.includes("banned") || raw.includes("blacklist"))
     return { valid: false, rejectionCode: "banned",   expiry: null };
@@ -76,23 +95,32 @@ function classifyResponse(data) {
   if (raw.includes("expired") || raw.includes("expir"))
     return { valid: false, rejectionCode: "expired",  expiry: null };
 
-  if (raw.includes("hwid") || raw.includes("device"))
-    return { valid: false, rejectionCode: "hwid",     expiry: null };
+  // HWID mismatch: solo cuando es un conflicto REAL de dispositivo
+  // "hwid mismatch" o "different device" pero NO "hwid locked" (ese es válido)
+  if (
+    (raw.includes("hwid") && raw.includes("mismatch")) ||
+    (raw.includes("hwid") && raw.includes("wrong"))    ||
+    (raw.includes("device") && raw.includes("different"))
+  ) return { valid: false, rejectionCode: "hwid", expiry: null };
 
   if (
     raw.includes("not found")      ||
-    raw.includes("invalid")        ||
     raw.includes("does not exist") ||
     raw.includes("revoked")        ||
-    raw.includes("key not")
+    raw.includes("key not")        ||
+    raw.includes("invalid key")
   ) return { valid: false, rejectionCode: "notfound", expiry: null };
 
+  // "invalid" solo si no cayó en ninguno de los casos anteriores
+  if (raw.includes("invalid"))
+    return { valid: false, rejectionCode: "notfound", expiry: null };
+
+  // Desconocido — loguear para investigar
+  console.log("[CLASSIFY] Mensaje no reconocido:", data?.message, "| data:", JSON.stringify(data));
   return { valid: false, rejectionCode: "unknown", expiry: null };
 }
 
-// ─── Formatear texto de expiración para mostrar en la app ────────────────────
-// Devuelve el timestamp Unix como string para que la app calcule el tiempo real,
-// o "Ilimitado" si no tiene vencimiento.
+// ─── Formatear payload de expiración ─────────────────────────────────────────
 function buildExpiryPayload(expiryRaw) {
   if (!expiryRaw || expiryRaw === "0") {
     return { expiryText: "Ilimitado ♾", expiryRaw: null, isLifetime: true };
@@ -118,20 +146,16 @@ function buildExpiryPayload(expiryRaw) {
   const dateStr = date.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric" });
 
   let expiryText;
-  if (days > 0)   expiryText = `${dateStr} | ${days}d ${hours}h restantes`;
-  else if (hours > 0) expiryText = `${dateStr} | ${hours}h ${mins}m restantes`;
-  else            expiryText = `Vence en ${mins} minuto(s)`;
+  if (days > 0)        expiryText = `${dateStr} | ${days}d ${hours}h restantes`;
+  else if (hours > 0)  expiryText = `${dateStr} | ${hours}h ${mins}m restantes`;
+  else                 expiryText = `Vence en ${mins} minuto(s)`;
 
   return { expiryText, expiryRaw: String(ts), isLifetime: false };
 }
 
 // ─── GET / ───────────────────────────────────────────────────────────────────
-app.get("/", (_req, res) => res.send("Backend de Bypass Apk funcionando ✔"));
-
-// ─── GET /api/ping ────────────────────────────────────────────────────────────
-app.get("/api/ping", (_req, res) => res.json({ ok: true }));
-
-// ─── GET /api/app-status ──────────────────────────────────────────────────────
+app.get("/",           (_req, res) => res.send("Backend de Bypass Apk funcionando ✔"));
+app.get("/api/ping",   (_req, res) => res.json({ ok: true }));
 app.get("/api/app-status", (_req, res) => res.json({ enabled: APP_ENABLED }));
 
 // ─── POST /api/login-key ──────────────────────────────────────────────────────
@@ -146,7 +170,7 @@ app.post("/api/login-key", async (req, res) => {
     const sessionid   = await keyauthInit();
     const licenseData = await keyauthLicense(key, hwid, sessionid);
 
-    console.log("[LOGIN] KeyAuth response:", JSON.stringify(licenseData));
+    console.log("[LOGIN] raw KeyAuth:", JSON.stringify(licenseData));
 
     const { valid, rejectionCode, expiry } = classifyResponse(licenseData);
     const expiryPayload = buildExpiryPayload(expiry);
@@ -166,7 +190,7 @@ app.post("/api/login-key", async (req, res) => {
   }
 });
 
-// ─── POST /api/verify-key — Verificación en cada apertura de la app ───────────
+// ─── POST /api/verify-key ─────────────────────────────────────────────────────
 app.post("/api/verify-key", async (req, res) => {
   const key  = (req.body.licenseKey || "").trim();
   const hwid = (req.body.hwid       || "").trim();
@@ -179,7 +203,7 @@ app.post("/api/verify-key", async (req, res) => {
     const sessionid   = await keyauthInit();
     const licenseData = await keyauthLicense(key, hwid, sessionid);
 
-    console.log("[VERIFY] KeyAuth response:", JSON.stringify(licenseData));
+    console.log("[VERIFY] raw KeyAuth:", JSON.stringify(licenseData));
 
     const { valid, rejectionCode, expiry } = classifyResponse(licenseData);
     const expiryPayload = buildExpiryPayload(expiry);
@@ -196,7 +220,6 @@ app.post("/api/verify-key", async (req, res) => {
 
   } catch (e) {
     console.error("[VERIFY] Error:", e.message);
-    // Servidor caído → no bloquear al usuario legítimo
     return res.json({ success: true, offline: true, rejectionCode: null, message: "Servidor no disponible" });
   }
 });
