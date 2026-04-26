@@ -1,6 +1,8 @@
 const express = require("express");
 const axios   = require("axios");
 const qs      = require("querystring");
+console.log("KeyAuth info completo:", JSON.stringify(licenseData?.info));
+console.log("KeyAuth respuesta completa:", JSON.stringify(licenseData));
 
 const app = express();
 app.use(express.json());
